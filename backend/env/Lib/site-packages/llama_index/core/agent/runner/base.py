@@ -141,6 +141,14 @@ class BaseAgentRunner(BaseAgent):
     ) -> AGENT_CHAT_RESPONSE_TYPE:
         """Finalize response."""
 
+    async def afinalize_response(
+        self,
+        task_id: str,
+        step_output: Optional[TaskStepOutput] = None,
+    ) -> AGENT_CHAT_RESPONSE_TYPE:
+        """Finalize response."""
+        return self.finalize_response(task_id, step_output)
+
     @abstractmethod
     def undo_step(self, task_id: str) -> None:
         """Undo previous step."""
@@ -392,14 +400,15 @@ class AgentRunner(BaseAgentRunner):
         **kwargs: Any,
     ) -> TaskStepOutput:
         """Execute step."""
-        dispatch_event = dispatcher.get_dispatch_event()
-
-        dispatch_event(AgentRunStepStartEvent(task_id=task_id, step=step, input=input))
         task = self.state.get_task(task_id)
         step_queue = self.state.get_step_queue(task_id)
         step = step or step_queue.popleft()
         if input is not None:
             step.input = input
+
+        dispatcher.event(
+            AgentRunStepStartEvent(task_id=task_id, step=step, input=input)
+        )
 
         if self.verbose:
             print(f"> Running step {step.step_id}. Step input: {step.input}")
@@ -421,7 +430,7 @@ class AgentRunner(BaseAgentRunner):
         completed_steps = self.state.get_completed_steps(task_id)
         completed_steps.append(cur_step_output)
 
-        dispatch_event(AgentRunStepEndEvent(step_output=cur_step_output))
+        dispatcher.event(AgentRunStepEndEvent(step_output=cur_step_output))
         return cur_step_output
 
     @dispatcher.span
@@ -434,9 +443,9 @@ class AgentRunner(BaseAgentRunner):
         **kwargs: Any,
     ) -> TaskStepOutput:
         """Execute step."""
-        dispatch_event = dispatcher.get_dispatch_event()
-
-        dispatch_event(AgentRunStepStartEvent(task_id=task_id, step=step, input=input))
+        dispatcher.event(
+            AgentRunStepStartEvent(task_id=task_id, step=step, input=input)
+        )
         task = self.state.get_task(task_id)
         step_queue = self.state.get_step_queue(task_id)
         step = step or step_queue.popleft()
@@ -462,7 +471,7 @@ class AgentRunner(BaseAgentRunner):
         completed_steps = self.state.get_completed_steps(task_id)
         completed_steps.append(cur_step_output)
 
-        dispatch_event(AgentRunStepEndEvent(step_output=cur_step_output))
+        dispatcher.event(AgentRunStepEndEvent(step_output=cur_step_output))
         return cur_step_output
 
     @dispatcher.span
@@ -550,6 +559,49 @@ class AgentRunner(BaseAgentRunner):
         if self.delete_task_on_finish:
             self.delete_task(task_id)
 
+        # Attach all sources generated across all steps
+        step_output.output.sources = self.get_task(task_id).extra_state.get(
+            "sources", []
+        )
+        step_output.output.set_source_nodes()
+
+        return cast(AGENT_CHAT_RESPONSE_TYPE, step_output.output)
+
+    @dispatcher.span
+    async def afinalize_response(
+        self,
+        task_id: str,
+        step_output: Optional[TaskStepOutput] = None,
+    ) -> AGENT_CHAT_RESPONSE_TYPE:
+        """Finalize response."""
+        if step_output is None:
+            step_output = self.state.get_completed_steps(task_id)[-1]
+        if not step_output.is_last:
+            raise ValueError(
+                "finalize_response can only be called on the last step output"
+            )
+
+        if not isinstance(
+            step_output.output,
+            (AgentChatResponse, StreamingAgentChatResponse),
+        ):
+            raise ValueError(
+                "When `is_last` is True, cur_step_output.output must be "
+                f"AGENT_CHAT_RESPONSE_TYPE: {step_output.output}"
+            )
+
+        # finalize task
+        await self.agent_worker.afinalize_task(self.state.get_task(task_id))
+
+        if self.delete_task_on_finish:
+            self.delete_task(task_id)
+
+        # Attach all sources generated across all steps
+        step_output.output.sources = self.get_task(task_id).extra_state.get(
+            "sources", []
+        )
+        step_output.output.set_source_nodes()
+
         return cast(AGENT_CHAT_RESPONSE_TYPE, step_output.output)
 
     @dispatcher.span
@@ -561,14 +613,12 @@ class AgentRunner(BaseAgentRunner):
         mode: ChatResponseMode = ChatResponseMode.WAIT,
     ) -> AGENT_CHAT_RESPONSE_TYPE:
         """Chat with step executor."""
-        dispatch_event = dispatcher.get_dispatch_event()
-
         if chat_history is not None:
             self.memory.set(chat_history)
         task = self.create_task(message)
 
         result_output = None
-        dispatch_event(AgentChatWithStepStartEvent(user_msg=message))
+        dispatcher.event(AgentChatWithStepStartEvent(user_msg=message))
         while True:
             # pass step queue in as argument, assume step executor is stateless
             cur_step_output = self._run_step(
@@ -586,7 +636,7 @@ class AgentRunner(BaseAgentRunner):
             task.task_id,
             result_output,
         )
-        dispatch_event(AgentChatWithStepEndEvent(response=result))
+        dispatcher.event(AgentChatWithStepEndEvent(response=result))
         return result
 
     @dispatcher.span
@@ -598,14 +648,12 @@ class AgentRunner(BaseAgentRunner):
         mode: ChatResponseMode = ChatResponseMode.WAIT,
     ) -> AGENT_CHAT_RESPONSE_TYPE:
         """Chat with step executor."""
-        dispatch_event = dispatcher.get_dispatch_event()
-
         if chat_history is not None:
             self.memory.set(chat_history)
         task = self.create_task(message)
 
         result_output = None
-        dispatch_event(AgentChatWithStepStartEvent(user_msg=message))
+        dispatcher.event(AgentChatWithStepStartEvent(user_msg=message))
         while True:
             # pass step queue in as argument, assume step executor is stateless
             cur_step_output = await self._arun_step(
@@ -619,11 +667,11 @@ class AgentRunner(BaseAgentRunner):
             # ensure tool_choice does not cause endless loops
             tool_choice = "auto"
 
-        result = self.finalize_response(
+        result = await self.afinalize_response(
             task.task_id,
             result_output,
         )
-        dispatch_event(AgentChatWithStepEndEvent(response=result))
+        dispatcher.event(AgentChatWithStepEndEvent(response=result))
         return result
 
     @dispatcher.span
@@ -699,7 +747,8 @@ class AgentRunner(BaseAgentRunner):
                 and chat_response.is_dummy_stream
             )
             e.on_end(payload={EventPayload.RESPONSE: chat_response})
-        return chat_response
+
+        return chat_response  # type: ignore
 
     @dispatcher.span
     @trace_method("chat")
@@ -724,7 +773,8 @@ class AgentRunner(BaseAgentRunner):
                 and chat_response.is_dummy_stream
             )
             e.on_end(payload={EventPayload.RESPONSE: chat_response})
-        return chat_response
+
+        return chat_response  # type: ignore
 
     def undo_step(self, task_id: str) -> None:
         """Undo previous step."""
@@ -778,8 +828,6 @@ class BasePlanningAgentRunner(AgentRunner):
         mode: ChatResponseMode = ChatResponseMode.WAIT,
     ) -> AGENT_CHAT_RESPONSE_TYPE:
         """Chat with step executor."""
-        dispatch_event = dispatcher.get_dispatch_event()
-
         if chat_history is not None:
             self.memory.set(chat_history)
 
@@ -787,7 +835,7 @@ class BasePlanningAgentRunner(AgentRunner):
         plan_id = self.create_plan(message)
 
         results = []
-        dispatch_event(AgentChatWithStepStartEvent(user_msg=message))
+        dispatcher.event(AgentChatWithStepStartEvent(user_msg=message))
         while True:
             # EXIT CONDITION: check if all sub-tasks are completed
             next_task_ids = self.get_next_tasks(plan_id)
@@ -812,7 +860,7 @@ class BasePlanningAgentRunner(AgentRunner):
             # refine the plan
             self.refine_plan(message, plan_id)
 
-        dispatch_event(
+        dispatcher.event(
             AgentChatWithStepEndEvent(
                 response=results[-1] if len(results) > 0 else None
             )
@@ -828,8 +876,6 @@ class BasePlanningAgentRunner(AgentRunner):
         mode: ChatResponseMode = ChatResponseMode.WAIT,
     ) -> AGENT_CHAT_RESPONSE_TYPE:
         """Chat with step executor."""
-        dispatch_event = dispatcher.get_dispatch_event()
-
         if chat_history is not None:
             self.memory.set(chat_history)
 
@@ -837,7 +883,7 @@ class BasePlanningAgentRunner(AgentRunner):
         plan_id = self.create_plan(message)
 
         results = []
-        dispatch_event(AgentChatWithStepStartEvent(user_msg=message))
+        dispatcher.event(AgentChatWithStepStartEvent(user_msg=message))
         while True:
             # EXIT CONDITION: check if all sub-tasks are completed
             next_task_ids = self.get_next_tasks(plan_id)
@@ -862,7 +908,7 @@ class BasePlanningAgentRunner(AgentRunner):
             # refine the plan
             await self.arefine_plan(message, plan_id)
 
-        dispatch_event(
+        dispatcher.event(
             AgentChatWithStepEndEvent(
                 response=results[-1] if len(results) > 0 else None
             )

@@ -6,3 +6,4 @@ pymupdf
 pypdf
 pydantic
 uvicorn[standard]
+python-multipart

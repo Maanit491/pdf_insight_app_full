@@ -5,9 +5,15 @@ from llama_index.core.query_engine import RetrieverQueryEngine
 from llama_index.core.indices.postprocessor import SimilarityPostprocessor
 from llama_index.core import VectorStoreIndex, SimpleDirectoryReader
 
-load_dotenv()
+if os.environ.get("ENV") != "production":
+    load_dotenv(override=True)
+# print("API Key:", os.getenv("OPENAI_API_KEY"))
 
-os.environ['OPENAI_API_KEY'] = os.getenv("OPENAI_API_KEY")
+api_key = os.getenv("OPENAI_API_KEY")
+if not api_key:
+    raise ValueError("OPENAI_API_KEY not found in environment variables or .env file.")
+os.environ["OPENAI_API_KEY"] = api_key
+
 
 def initialize_query_engine():
     folder = 'uploaded_files'

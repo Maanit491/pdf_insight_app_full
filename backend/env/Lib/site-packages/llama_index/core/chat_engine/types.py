@@ -4,9 +4,11 @@ import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
+from functools import partial
+from inspect import iscoroutinefunction
 from queue import Queue, Empty
 from threading import Event
-from typing import AsyncGenerator, Generator, List, Optional, Union
+from typing import AsyncGenerator, Callable, Generator, List, Optional, Union, Dict, Any
 
 from llama_index.core.base.llms.types import (
     ChatMessage,
@@ -17,6 +19,7 @@ from llama_index.core.base.response.schema import Response, StreamingResponse
 from llama_index.core.memory import BaseMemory
 from llama_index.core.schema import NodeWithScore
 from llama_index.core.tools import ToolOutput
+from llama_index.core.instrumentation import DispatcherSpanMixin
 from llama_index.core.instrumentation.events.chat_engine import (
     StreamChatErrorEvent,
     StreamChatEndEvent,
@@ -33,7 +36,10 @@ logger.setLevel(logging.WARNING)
 
 def is_function(message: ChatMessage) -> bool:
     """Utility for ChatMessage responses from OpenAI models."""
-    return "tool_calls" in message.additional_kwargs
+    return (
+        "tool_calls" in message.additional_kwargs
+        and len(message.additional_kwargs["tool_calls"]) > 0
+    )
 
 
 class ChatResponseMode(str, Enum):
@@ -51,12 +57,16 @@ class AgentChatResponse:
     sources: List[ToolOutput] = field(default_factory=list)
     source_nodes: List[NodeWithScore] = field(default_factory=list)
     is_dummy_stream: bool = False
+    metadata: Optional[Dict[str, Any]] = None
 
-    def __post_init__(self) -> None:
+    def set_source_nodes(self) -> None:
         if self.sources and not self.source_nodes:
             for tool_output in self.sources:
                 if isinstance(tool_output.raw_output, (Response, StreamingResponse)):
                     self.source_nodes.extend(tool_output.raw_output.source_nodes)
+
+    def __post_init__(self) -> None:
+        self.set_source_nodes()
 
     def __str__(self) -> str:
         return self.response
@@ -111,14 +121,19 @@ class StreamingAgentChatResponse:
     is_function_false_event: Optional[asyncio.Event] = None
     # signal when an OpenAI function is being executed
     is_function_not_none_thread_event: Event = field(default_factory=Event)
+    is_writing_to_memory: bool = True
     # Track if an exception occurred
     exception: Optional[Exception] = None
+    awrite_response_to_history_task: Optional[asyncio.Task] = None
 
-    def __post_init__(self) -> None:
+    def set_source_nodes(self) -> None:
         if self.sources and not self.source_nodes:
             for tool_output in self.sources:
                 if isinstance(tool_output.raw_output, (Response, StreamingResponse)):
                     self.source_nodes.extend(tool_output.raw_output.source_nodes)
+
+    def __post_init__(self) -> None:
+        self.set_source_nodes()
 
     def __str__(self) -> str:
         if self.is_done and not self.queue.empty() and not self.is_function:
@@ -141,6 +156,9 @@ class StreamingAgentChatResponse:
         self.is_function_not_none_thread_event.set()
 
     def aput_in_queue(self, delta: Optional[str]) -> None:
+        assert self.aqueue is not None
+        assert self.new_item_event is not None
+
         self.aqueue.put_nowait(delta)
         self.new_item_event.set()
 
@@ -148,22 +166,21 @@ class StreamingAgentChatResponse:
     def write_response_to_history(
         self,
         memory: BaseMemory,
-        on_stream_end_fn: Optional[callable] = None,
+        on_stream_end_fn: Optional[Callable] = None,
     ) -> None:
         if self.chat_stream is None:
             raise ValueError(
                 "chat_stream is None. Cannot write to history without chat_stream."
             )
-        dispatch_event = dispatcher.get_dispatch_event()
 
         # try/except to prevent hanging on error
-        dispatch_event(StreamChatStartEvent())
+        dispatcher.event(StreamChatStartEvent())
         try:
             final_text = ""
             for chat in self.chat_stream:
                 self.is_function = is_function(chat.message)
                 if chat.delta:
-                    dispatch_event(
+                    dispatcher.event(
                         StreamChatDeltaReceivedEvent(
                             delta=chat.delta,
                         )
@@ -176,7 +193,7 @@ class StreamingAgentChatResponse:
                 chat.message.content = final_text.strip()  # final message
                 memory.put(chat.message)
         except Exception as e:
-            dispatch_event(StreamChatErrorEvent(exception=e))
+            dispatcher.event(StreamChatErrorEvent(exception=e))
             self.exception = e
 
             # This act as is_done events for any consumers waiting
@@ -185,7 +202,7 @@ class StreamingAgentChatResponse:
             # force the queue reader to see the exception
             self.put_in_queue("")
             raise
-        dispatch_event(StreamChatEndEvent())
+        dispatcher.event(StreamChatEndEvent())
 
         self.is_done = True
 
@@ -198,10 +215,12 @@ class StreamingAgentChatResponse:
     async def awrite_response_to_history(
         self,
         memory: BaseMemory,
-        on_stream_end_fn: Optional[callable] = None,
+        on_stream_end_fn: Optional[Callable] = None,
     ) -> None:
         self._ensure_async_setup()
-        dispatch_event = dispatcher.get_dispatch_event()
+        assert self.aqueue is not None
+        assert self.is_function_false_event is not None
+        assert self.new_item_event is not None
 
         if self.achat_stream is None:
             raise ValueError(
@@ -210,13 +229,13 @@ class StreamingAgentChatResponse:
             )
 
         # try/except to prevent hanging on error
-        dispatch_event(StreamChatStartEvent())
+        dispatcher.event(StreamChatStartEvent())
         try:
             final_text = ""
             async for chat in self.achat_stream:
                 self.is_function = is_function(chat.message)
                 if chat.delta:
-                    dispatch_event(
+                    dispatcher.event(
                         StreamChatDeltaReceivedEvent(
                             delta=chat.delta,
                         )
@@ -230,9 +249,9 @@ class StreamingAgentChatResponse:
                 # NOTE: this is to handle the special case where we consume some of the
                 # chat stream, but not all of it (e.g. in react agent)
                 chat.message.content = final_text.strip()  # final message
-                memory.put(chat.message)
+                await memory.aput(chat.message)
         except Exception as e:
-            dispatch_event(StreamChatErrorEvent(exception=e))
+            dispatcher.event(StreamChatErrorEvent(exception=e))
             self.exception = e
 
             # These act as is_done events for any consumers waiting
@@ -242,49 +261,84 @@ class StreamingAgentChatResponse:
             # force the queue reader to see the exception
             self.aput_in_queue("")
             raise
-        dispatch_event(StreamChatEndEvent())
+        dispatcher.event(StreamChatEndEvent())
         self.is_done = True
 
         # These act as is_done events for any consumers waiting
         self.is_function_false_event.set()
         self.new_item_event.set()
         if on_stream_end_fn is not None and not self.is_function:
-            on_stream_end_fn()
+            if iscoroutinefunction(
+                on_stream_end_fn.func
+                if isinstance(on_stream_end_fn, partial)
+                else on_stream_end_fn
+            ):
+                await on_stream_end_fn()
+            else:
+                on_stream_end_fn()
 
     @property
     def response_gen(self) -> Generator[str, None, None]:
-        while not self.is_done or not self.queue.empty():
-            if self.exception is not None:
-                raise self.exception
-
-            try:
-                delta = self.queue.get(block=False)
-                self.unformatted_response += delta
-                yield delta
-            except Empty:
-                # Queue is empty, but we're not done yet. Sleep for 0 secs to release the GIL and allow other threads to run.
-                time.sleep(0)
-        self.response = self.unformatted_response.strip()
-
-    async def async_response_gen(self) -> AsyncGenerator[str, None]:
-        self._ensure_async_setup()
-        while True:
-            if not self.aqueue.empty() or not self.is_done:
+        if self.is_writing_to_memory:
+            while not self.is_done or not self.queue.empty():
                 if self.exception is not None:
                     raise self.exception
 
                 try:
-                    delta = await asyncio.wait_for(self.aqueue.get(), timeout=0.1)
-                except asyncio.TimeoutError:
-                    if self.is_done:
-                        break
-                    continue
-                if delta is not None:
+                    delta = self.queue.get(block=False)
                     self.unformatted_response += delta
                     yield delta
-            else:
-                break
+                except Empty:
+                    # Queue is empty, but we're not done yet. Sleep for 0 secs to release the GIL and allow other threads to run.
+                    time.sleep(0)
+        else:
+            if self.chat_stream is None:
+                raise ValueError("chat_stream is None!")
+
+            for chat_response in self.chat_stream:
+                self.unformatted_response += chat_response.delta or ""
+                yield chat_response.delta or ""
         self.response = self.unformatted_response.strip()
+
+    async def async_response_gen(self) -> AsyncGenerator[str, None]:
+        try:
+            self._ensure_async_setup()
+            assert self.aqueue is not None
+
+            if self.is_writing_to_memory:
+                while True:
+                    if not self.aqueue.empty() or not self.is_done:
+                        if self.exception is not None:
+                            raise self.exception
+
+                        try:
+                            delta = await asyncio.wait_for(
+                                self.aqueue.get(), timeout=0.1
+                            )
+                        except asyncio.TimeoutError:
+                            if self.is_done:
+                                break
+                            continue
+                        if delta is not None:
+                            self.unformatted_response += delta
+                            yield delta
+                    else:
+                        break
+            else:
+                if self.achat_stream is None:
+                    raise ValueError("achat_stream is None!")
+
+                async for chat_response in self.achat_stream:
+                    self.unformatted_response += chat_response.delta or ""
+                    yield chat_response.delta or ""
+            self.response = self.unformatted_response.strip()
+        finally:
+            if self.awrite_response_to_history_task:
+                # Make sure that the background task ran to completion, retrieve any exceptions
+                await self.awrite_response_to_history_task
+                self.awrite_response_to_history_task = (
+                    None  # No need to keep the reference to the finished task
+                )
 
     def print_response_stream(self) -> None:
         for token in self.response_gen:
@@ -298,7 +352,7 @@ class StreamingAgentChatResponse:
 AGENT_CHAT_RESPONSE_TYPE = Union[AgentChatResponse, StreamingAgentChatResponse]
 
 
-class BaseChatEngine(ABC):
+class BaseChatEngine(DispatcherSpanMixin, ABC):
     """Base Chat Engine."""
 
     @abstractmethod
